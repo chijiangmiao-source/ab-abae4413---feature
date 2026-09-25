@@ -92,6 +92,26 @@ def create_app(db_path: str | None = None) -> Flask:
         result = store.invalidate(operation_id, record_id)
         return jsonify(result), 200
 
+    # ---------------- 替代重建 ---------------- #
+    @app.post("/api/records/<record_id>/rebuild")
+    def rebuild(record_id: str):
+        data = parse_json()
+        operation_id = data.get("operation_id")
+        payload = data.get("payload", data.get("replacement_payload"))
+        if not operation_id or not isinstance(operation_id, str):
+            raise StoreError(
+                "OPERATION_ID_REQUIRED",
+                "替代重建必须携带非空操作标识 operation_id", status=400)
+        if payload is None:
+            raise StoreError(
+                "REPLACEMENT_PAYLOAD_REQUIRED",
+                "替代重建必须提供替代读数 payload（对象）", status=400)
+        if not isinstance(payload, dict):
+            raise StoreError("INVALID_PAYLOAD", "payload 必须是对象",
+                             status=400)
+        result = store.rebuild(operation_id, record_id, payload)
+        return jsonify(result), 200
+
     @app.get("/api/operations/<operation_id>")
     def get_operation(operation_id: str):
         result = store.get_operation(operation_id)
@@ -100,6 +120,10 @@ def create_app(db_path: str | None = None) -> Flask:
                              f"操作标识 {operation_id} 无记录", status=404,
                              details={"operation_id": operation_id})
         return jsonify(result)
+
+    @app.get("/api/rebuilds")
+    def list_rebuilds():
+        return jsonify(store.list_rebuilds())
 
     # ---------------- 错误处理 ---------------- #
     @app.errorhandler(StoreError)

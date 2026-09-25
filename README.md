@@ -16,6 +16,16 @@
   并返回带定位信息（`details`）的错误码。
 - **并发不变量**：新推导与失效裁决竞争后，不存在有效记录依赖失效记录
   （所有写事务经 `BEGIN IMMEDIATE` + 进程内锁串行化，校验与写入在同一事务）。
+- **替代重建**：有效原始读数失真时，工程师可在谱系页填写**替代读数**与
+  **稳定修复操作标识**发起重建。服务端在同一持久化事务内：
+  复查目标仍为有效原始记录 → 写入前确认受影响推导的未替换直接依据仍有效 →
+  为该记录及全部**可达的有效推导记录**按依赖层级创建副本（替代根携带替代读数，
+  其余副本保留原有业务内容；已重建的直接依据替换为新编号，其余依据继续指向原
+  记录）→ 旧根与旧下游整体失效，返回稳定的旧→新编号映射、有效性与直接依据。
+- **重建幂等/冲突**：同一修复标识携带相同目标和替代内容重试，重放首次映射
+  （`replayed=true`，不产生新副本）；改换目标或替代内容任一参数 →
+  `409 OPERATION_CONFLICT` 且不留副本。重建与失效裁决竞争时只能得到
+  “完整重建”或“无状态变化的拒绝”，绝不存在有效记录引用已失效记录。
 - **重启持久化**：谱系、失效状态和操作重放结果存于 SQLite，重启后仍可查询。
 
 ## 接口
@@ -28,7 +38,29 @@
 | GET | `/api/records` | 全部记录（编号/有效性/直接依据） |
 | GET | `/api/records/<id>` | 单条记录 |
 | POST | `/api/records/<id>/invalidate` | 失效裁决（请求体含 `operation_id`） |
-| GET | `/api/operations/<operation_id>` | 查询裁决首次结果 |
+| POST | `/api/records/<id>/rebuild` | 替代重建（请求体含 `operation_id` 与替代读数 `payload`） |
+| GET | `/api/operations/<operation_id>` | 查询裁决/重建首次结果 |
+| GET | `/api/rebuilds` | 全部替代重建（新旧两支谱系与映射） |
+
+重建成功响应（关键字段）：
+
+```json
+{
+  "operation_id": "fix-20260925-001",
+  "result": "completed",
+  "replayed": false,
+  "target_record_id": "R000001",
+  "replacement_record_id": "R000006",
+  "mapping": [
+    {"old_id": "R000001", "new_id": "R000006", "level": 0,
+     "status": "valid", "parent_ids": []},
+    {"old_id": "R000003", "new_id": "R000007", "level": 1,
+     "status": "valid", "parent_ids": ["R000006", "R000002"]}
+  ],
+  "rebuilt":   [{"id": "R000006", "status": "valid", "parent_ids": []}],
+  "invalidated": [{"id": "R000001", "invalidated_by": "R000001"}]
+}
+```
 
 错误响应形如：
 
@@ -39,7 +71,9 @@
 
 错误码：`PARENT_NOT_FOUND` / `SELF_REFERENCE` / `CYCLE_DETECTED` /
 `PARENT_INVALID` / `RECORD_NOT_FOUND` / `RECORD_ALREADY_INVALID` /
-`OPERATION_CONFLICT` / `OPERATION_ID_REQUIRED` 等。
+`OPERATION_CONFLICT` / `OPERATION_ID_REQUIRED` /
+`REBUILD_TARGET_MUST_BE_RAW` / `REPLACEMENT_PAYLOAD_REQUIRED` /
+`REBUILD_BASIS_INVALID` 等。
 
 ## 快速开始（宿主机）
 
@@ -79,14 +113,17 @@ docker compose --profile verify run --rm verify
 ## 测试
 
 ```bash
-.venv/bin/pytest -q          # 21 个单元/接口用例
+.venv/bin/pytest -q          # 单元/接口用例（含替代重建与并发竞争）
 ./verify                     # 一次性验收（含跨进程并发与重启）
 ```
 
 ## 关键实现位置
 
-- `app/store.py`：单事务级联失效（递归 CTE 求下游闭包）、操作标识幂等/冲突、
-  四类引用校验、`BEGIN IMMEDIATE` 串行化、完整性自检。
-- `app/server.py`：页面、健康端点与 JSON API、统一可定位错误体。
+- `app/store.py`：单事务级联失效（递归 CTE 求下游闭包）、单事务替代重建
+  （依赖层级波次复制 + 依据换线 + 旧支失效）、操作标识幂等/冲突（两类操作
+  共用标识空间与参数指纹）、四类引用校验、`BEGIN IMMEDIATE` 串行化、完整性自检。
+- `app/server.py`：页面、健康端点与 JSON API（含 `rebuild` / `rebuilds`）、
+  统一可定位错误体。
 - `scripts/verify.py` / `verify`：一次性验收服务。
-- `tests/`：存储层与 HTTP 接口用例（含 60+ 线程并发竞争与重启持久化）。
+- `tests/`：存储层与 HTTP 接口用例（含 60+ 线程并发竞争、重建↔裁决竞争与
+  重启持久化）。

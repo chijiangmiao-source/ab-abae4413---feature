@@ -85,3 +85,27 @@ button.linklike { background: none; color: var(--accent); font-weight: 400; padd
 .muted { color: var(--muted); }
 .error-text { color: var(--danger); }
 .ok-text { color: var(--ok); }
+
+/* 替代重建：新旧两支谱系 */
+.record.branch-new { border-color: rgba(56,211,159,.55); box-shadow: inset 3px 0 0 var(--ok); }
+.record.branch-old { opacity: .72; box-shadow: inset 3px 0 0 var(--danger); }
+.pid.stale { color: var(--danger); text-decoration: line-through; }
+.pid.fresh { color: var(--ok); }
+.arrow { color: var(--muted); margin: 0 .15rem; }
+.rebuild-note { font-size: .78rem; }
+.legend { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; font-size: .78rem; margin-bottom: .6rem; }
+.legend .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; margin-right: .3rem; }
+.legend .dot.valid { background: var(--ok); }
+.legend .dot.invalid { background: var(--danger); }
+
+.mappings { display: flex; flex-direction: column; gap: .8rem; max-height: 520px; overflow: auto; }
+.mapping-block { border: 1px solid var(--border); border-radius: 8px; padding: .6rem .75rem; background: var(--panel-2); }
+.mapping-head { display: flex; gap: .45rem; align-items: center; flex-wrap: wrap; margin-bottom: .45rem; font-size: .85rem; }
+.mapping-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+.mapping-table th { text-align: left; color: var(--muted); font-weight: 400; padding: .2rem .35rem; border-bottom: 1px solid var(--border); }
+.mapping-table td { padding: .25rem .35rem; border-bottom: 1px solid rgba(43,54,86,.5); vertical-align: top; }
+.mapping-table .level { color: var(--muted); white-space: nowrap; }
+.mapping-table .arrow-cell { color: var(--muted); width: 1.5rem; text-align: center; }
+.small { font-size: .76rem; }
+.mapping-foot { margin-top: .4rem; }
+code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--accent); }

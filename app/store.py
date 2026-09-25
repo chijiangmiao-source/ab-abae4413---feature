@@ -6,7 +6,11 @@
 2. 操作标识幂等：重复裁决返回首次结果；同一操作标识改换目标 -> 冲突且不改状态；
 3. 新建推导记录时，任一前序不存在 / 已失效 / 自引用 / 成环 -> 整笔拒绝，既有结论不变；
 4. 写事务串行化（BEGIN IMMEDIATE），因此“新推导”与“失效裁决”竞争后，
-   不可能存在有效记录依赖失效记录。
+   不可能存在有效记录依赖失效记录；
+5. 替代重建：在同一事务内复查目标仍为有效原始记录、受影响推导的未替换直接
+   依据仍有效，随后按依赖层级复制目标及全部可达的有效推导（已重建依据指向新
+   编号，其余依据继续指向原记录），再使旧根与旧下游失效。同操作标识同参数
+   重试重放首次映射，改换任一参数冲突且不留任何副本。
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ CREATE TABLE IF NOT EXISTS operations (
     operation_id     TEXT PRIMARY KEY,
     kind             TEXT NOT NULL,
     target_record_id TEXT NOT NULL,
+    params_json      TEXT,
     response_json    TEXT NOT NULL,
     created_at       TEXT NOT NULL
 );
@@ -85,6 +90,12 @@ class CalibrationStore:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # 旧库平滑升级：operations.params_json 记录首次操作参数指纹
+            cols = {r["name"] for r in
+                    self._conn.execute("PRAGMA table_info(operations)")}
+            if "params_json" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE operations ADD COLUMN params_json TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -127,6 +138,14 @@ class CalibrationStore:
         if row is None:
             return None
         return json.loads(row["response_json"])
+
+    def list_rebuilds(self) -> list[dict[str, Any]]:
+        """全部替代重建操作的首次结果（供页面展示新旧两支谱系与映射）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT response_json FROM operations WHERE kind='rebuild' "
+                "ORDER BY created_at, operation_id").fetchall()
+        return [json.loads(r["response_json"]) for r in rows]
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row, parents: list[str]) -> dict[str, Any]:
@@ -337,11 +356,14 @@ class CalibrationStore:
                         for rid in closure
                     ],
                 }
+                inv_params = json.dumps(
+                    {"kind": "invalidate", "target_record_id": target_id},
+                    ensure_ascii=False, sort_keys=True)
                 self._conn.execute(
                     "INSERT INTO operations (operation_id, kind, "
-                    "target_record_id, response_json, created_at) "
-                    "VALUES (?, 'invalidate', ?, ?, ?)",
-                    (operation_id, target_id,
+                    "target_record_id, params_json, response_json, created_at) "
+                    "VALUES (?, 'invalidate', ?, ?, ?, ?)",
+                    (operation_id, target_id, inv_params,
                      json.dumps(response, ensure_ascii=False), now))
                 self._conn.execute("COMMIT")
             except Exception:
@@ -363,6 +385,221 @@ class CalibrationStore:
             SELECT id FROM reach ORDER BY id
             """, (target_id,)).fetchall()
         return [r["id"] for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 替代重建（复制有效子树 + 旧支失效，单事务）
+    # ------------------------------------------------------------------ #
+    def rebuild(self, operation_id: str, target_id: str,
+                replacement_payload: dict[str, Any]) -> dict[str, Any]:
+        if not operation_id:
+            raise StoreError("OPERATION_ID_REQUIRED",
+                             "替代重建必须携带非空操作标识", status=400)
+        if not isinstance(replacement_payload, dict):
+            raise StoreError("REPLACEMENT_PAYLOAD_REQUIRED",
+                             "替代重建必须提供替代读数 payload（对象）",
+                             status=400)
+
+        # 参数指纹：目标编号 + 替代内容。同标识同参数重放，改任一参数即冲突。
+        params = {"kind": "rebuild", "target_record_id": target_id,
+                  "replacement_payload": replacement_payload}
+        params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                # 1) 操作标识幂等 / 冲突判定（与失效裁决共用同一标识空间）
+                op = self._conn.execute(
+                    "SELECT kind, target_record_id, params_json, response_json "
+                    "FROM operations WHERE operation_id=?",
+                    (operation_id,)).fetchone()
+                if op is not None:
+                    if op["kind"] == "rebuild" and op["params_json"] == params_json:
+                        # 同标识 + 同目标 + 同替代内容：重放首次映射，不改状态
+                        replay = json.loads(op["response_json"])
+                        replay["replayed"] = True
+                        self._conn.execute("COMMIT")
+                        return replay
+                    raise StoreError(
+                        "OPERATION_CONFLICT",
+                        f"操作标识 {operation_id} 已用于 "
+                        f"{op['kind']}({op['target_record_id']})，"
+                        f"不能改用于 rebuild({target_id}) 的另一组参数",
+                        status=409,
+                        details={"operation_id": operation_id,
+                                 "original_kind": op["kind"],
+                                 "original_target": op["target_record_id"],
+                                 "conflicting_kind": "rebuild",
+                                 "conflicting_target": target_id})
+
+                # 2) 事务内复查：目标存在、仍为“有效原始记录”
+                target = self._conn.execute(
+                    "SELECT id, kind, status FROM records WHERE id=?",
+                    (target_id,)).fetchone()
+                if target is None:
+                    raise StoreError(
+                        "RECORD_NOT_FOUND",
+                        f"重建目标记录 {target_id} 不存在", status=404,
+                        details={"record_id": target_id,
+                                 "operation_id": operation_id})
+                if target["kind"] != "raw":
+                    raise StoreError(
+                        "REBUILD_TARGET_MUST_BE_RAW",
+                        f"记录 {target_id} 不是原始读数，"
+                        "替代重建只能针对有效的原始记录发起",
+                        details={"record_id": target_id, "kind": target["kind"]})
+                if target["status"] != "valid":
+                    # 与失效裁决竞争失败：拒绝且不留任何状态变化
+                    raise StoreError(
+                        "RECORD_ALREADY_INVALID",
+                        f"记录 {target_id} 已失效，不能作为替代重建目标",
+                        status=409,
+                        details={"record_id": target_id,
+                                 "operation_id": operation_id})
+
+                # 3) 目标 + 全部可达下游闭包；仅仍有效的节点参与复制
+                closure = self._downstream_closure_locked(target_id)
+                qmarks = ",".join("?" * len(closure))
+                rows = {r["id"]: r for r in self._conn.execute(
+                    f"SELECT id, kind, payload, status, created_at "
+                    f"FROM records WHERE id IN ({qmarks})", closure)}
+                valid_ids = {rid for rid in closure
+                             if rows[rid]["status"] == "valid"}
+
+                # 读入闭包内的直接依据边（保留 seq 次序）
+                edge_rows = self._conn.execute(
+                    f"SELECT child_id, parent_id, seq FROM edges "
+                    f"WHERE child_id IN ({qmarks}) ORDER BY child_id, seq",
+                    closure).fetchall()
+                parents_of: dict[str, list[str]] = {}
+                children_of: dict[str, list[str]] = {}
+                for e in edge_rows:
+                    parents_of.setdefault(e["child_id"], []).append(
+                        e["parent_id"])
+                    children_of.setdefault(e["parent_id"], []).append(
+                        e["child_id"])
+
+                # 4) 写入前最后复查：每个受影响有效推导的“未替换直接依据”
+                #    （不在有效闭包内、不会被复制的依据）必须仍有效。
+                #    有效节点不可能依赖闭包内失效节点（全局不变量），
+                #    此处捕获的是与本事务竞争后刚刚失效的闭包外依据。
+                invalid_basis: dict[str, list[str]] = {}
+                outside = {p for rid in valid_ids for p in parents_of.get(rid, [])
+                           if p not in valid_ids}
+                if outside:
+                    oat = ",".join("?" * len(outside))
+                    ostatus = {r["id"]: r["status"] for r in self._conn.execute(
+                        f"SELECT id, status FROM records WHERE id IN ({oat})",
+                        tuple(outside))}
+                    for rid in valid_ids:
+                        if rid == target_id:
+                            continue
+                        bad = [p for p in parents_of.get(rid, [])
+                               if p in outside and ostatus.get(p) != "valid"]
+                        if bad:
+                            invalid_basis[rid] = bad
+                if invalid_basis:
+                    flat = sorted({p for ps in invalid_basis.values()
+                                   for p in ps})
+                    raise StoreError(
+                        "REBUILD_BASIS_INVALID",
+                        "替代重建写入前复查发现受影响推导的未替换直接依据"
+                        "已失效，整笔重建拒绝（不产生任何副本）",
+                        status=409,
+                        details={"record_id": target_id,
+                                 "invalid_parent_ids": flat,
+                                 "affected_record_ids":
+                                     sorted(invalid_basis)})
+
+                # 5) 按依赖层级（Kahn 波次：所有闭包内依据就绪才进入下一层）
+                #    创建副本。已重建依据替换为新编号，其余依据指向原记录。
+                now = _utcnow()
+                mapping: dict[str, str] = {}
+                mapping_entries: list[dict[str, Any]] = []
+                rebuilt_entries: list[dict[str, Any]] = []
+                remaining = {rid: sum(1 for p in parents_of.get(rid, [])
+                                      if p in valid_ids)
+                             for rid in valid_ids}
+                frontier = [target_id]
+                level = 0
+                while frontier:
+                    frontier.sort(key=lambda r: (rows[r]["created_at"], r))
+                    nxt: set[str] = set()
+                    for old_id in frontier:
+                        new_id = self._allocate_id_locked()
+                        mapping[old_id] = new_id
+                        payload = (replacement_payload if old_id == target_id
+                                   else json.loads(rows[old_id]["payload"]))
+                        self._conn.execute(
+                            "INSERT INTO records (id, kind, payload, status, "
+                            "invalidated_by, invalidated_at, created_at) "
+                            "VALUES (?, ?, ?, 'valid', NULL, NULL, ?)",
+                            (new_id, rows[old_id]["kind"],
+                             json.dumps(payload, ensure_ascii=False), now))
+                        new_parents: list[str] = []
+                        for seq, p in enumerate(parents_of.get(old_id, [])):
+                            np = mapping.get(p, p)  # 已重建->新编号，否则原记录
+                            new_parents.append(np)
+                            self._conn.execute(
+                                "INSERT INTO edges (child_id, parent_id, seq) "
+                                "VALUES (?, ?, ?)", (new_id, np, seq))
+                        mapping_entries.append({
+                            "old_id": old_id, "new_id": new_id,
+                            "level": level, "status": "valid",
+                            "parent_ids": new_parents})
+                        rebuilt_entries.append({
+                            "id": new_id, "status": "valid",
+                            "parent_ids": new_parents})
+                        for ch in children_of.get(old_id, []):
+                            if ch in valid_ids:
+                                remaining[ch] -= 1
+                                if remaining[ch] == 0:
+                                    nxt.add(ch)
+                    frontier = list(nxt)
+                    level += 1
+
+                if len(mapping) != len(valid_ids):
+                    # 理论上不可达（有效节点不可能经由失效节点仍可达），
+                    # 防御性兜底：宁可回滚也不留半成品。
+                    raise StoreError(
+                        "REBUILD_INTERNAL_ERROR",
+                        "依赖层级遍历未覆盖全部有效节点，已回滚", status=500,
+                        details={"target_record_id": target_id,
+                                 "expected": len(valid_ids),
+                                 "mapped": len(mapping)})
+
+                # 6) 旧根与旧下游整体失效（早已失效者保留其首次稳定来源）
+                invalidated = [
+                    {"id": rid, "invalidated_by": target_id}
+                    for rid in closure if rows[rid]["status"] == "valid"]
+                self._conn.execute(
+                    "UPDATE records SET status='invalid', "
+                    "invalidated_by=?, invalidated_at=? "
+                    "WHERE id IN (%s) AND status='valid'"
+                    % ",".join("?" * len(closure)),
+                    (target_id, now, *closure))
+
+                response = {
+                    "operation_id": operation_id,
+                    "result": "completed",
+                    "replayed": False,
+                    "target_record_id": target_id,
+                    "replacement_record_id": mapping[target_id],
+                    "mapping": mapping_entries,
+                    "rebuilt": rebuilt_entries,
+                    "invalidated": invalidated,
+                }
+                self._conn.execute(
+                    "INSERT INTO operations (operation_id, kind, "
+                    "target_record_id, params_json, response_json, created_at) "
+                    "VALUES (?, 'rebuild', ?, ?, ?, ?)",
+                    (operation_id, target_id, params_json,
+                     json.dumps(response, ensure_ascii=False), now))
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+        return response
 
     # ------------------------------------------------------------------ #
     # 完整性自检（验收用）

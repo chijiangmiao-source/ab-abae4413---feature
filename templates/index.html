@@ -53,8 +53,38 @@
   </section>
 
   <section class="card">
+    <h2>替代重建</h2>
+    <p class="sub" style="margin:0 0 .6rem">
+      有效原始读数失真时，以替代读数重建该记录及全部可达的有效推导：
+      副本保留原结论，已重建依据指向新编号，其余依据不变；旧根与旧下游在同一事务内失效。
+    </p>
+    <form id="rebuild-form" class="inline-form">
+      <label>目标原始记录编号
+        <input id="rb-target" type="text" placeholder="R000001（须为有效原始记录）" required>
+      </label>
+      <label>替代读数内容
+        <input id="rb-value" type="text" placeholder="例如 detector-A @ 77K = 12.1 mV（修正值）" required>
+      </label>
+      <label>修复操作标识（幂等键）
+        <input id="rb-op" type="text" placeholder="例如 fix-20260925-001" required>
+      </label>
+      <button type="submit">发起替代重建</button>
+    </form>
+  </section>
+
+  <section class="card">
     <h2>记录谱系 <button id="refresh" type="button" class="linklike">刷新</button></h2>
+    <div class="legend">
+      <span><i class="dot valid"></i>新支 / 有效</span>
+      <span><i class="dot invalid"></i>旧支 / 已失效</span>
+      <span class="muted">重建映射在记录卡上以「旧编号 → 新编号」标注</span>
+    </div>
     <div id="records" class="records"></div>
+  </section>
+
+  <section class="card">
+    <h2>重建映射（新旧两支谱系）</h2>
+    <div id="mappings" class="mappings"><p class="muted">尚未发起替代重建。</p></div>
   </section>
 
   <section class="card">
