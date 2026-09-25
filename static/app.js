@@ -58,16 +58,71 @@ function renderRecords() {
           r.invalidated_at ? ` · ${esc(r.invalidated_at)}` : ""
         }</div>`
       : "";
+    const rebuilt = r.rebuilt_from
+      ? `<div class="meta">替代自：<span class="pid">${esc(r.rebuilt_from)}</span>` +
+        `（修复标识 <span class="src rebuild-text">${esc(r.rebuilt_by || "")}</span>）</div>`
+      : "";
     return `
       <div class="record">
         <div class="head">
           <span class="id">${esc(r.id)}</span>
           <span class="badge ${esc(r.kind)}">${r.kind === "raw" ? "原始" : "推导"}</span>
           <span class="badge ${esc(r.status)}">${r.status === "valid" ? "有效" : "已失效"}</span>
+          ${r.rebuilt_from ? '<span class="badge rebuilt">替代副本</span>' : ""}
         </div>
         <div class="meta">${esc(text)}</div>
         ${basis}
+        ${rebuilt}
         ${src}
+      </div>`;
+  }).join("");
+  renderMappings();
+}
+
+function renderMappings() {
+  const box = $("#mappings");
+  if (!box) return;
+  // 按修复标识归集旧->新映射（新记录上带 rebuilt_from / rebuilt_by）
+  const groups = new Map();
+  for (const r of state.records) {
+    if (!r.rebuilt_from) continue;
+    const key = r.rebuilt_by || "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push([r.rebuilt_from, r.id, r]);
+  }
+  if (!groups.size) {
+    box.innerHTML = '<p class="muted">尚无替代重建。发起重建后，这里会并排列出旧支与新支及其编号映射。</p>';
+    return;
+  }
+  box.innerHTML = [...groups.entries()].map(([op, pairs]) => {
+    pairs.sort((a, b) => a[0].localeCompare(b[0]));
+    const rows = pairs.map(([oldId, newId, nr]) => {
+      const old = state.records.find((x) => x.id === oldId);
+      const oldText = old && typeof old.payload.value !== "undefined"
+        ? old.payload.value : "";
+      const newText = typeof nr.payload.value !== "undefined"
+        ? nr.payload.value : "";
+      return `
+        <div class="map-row">
+          <span class="branch old-branch">
+            <span class="id">${esc(oldId)}</span>
+            <span class="badge ${old ? esc(old.status) : "invalid"}">${
+              old ? (old.status === "valid" ? "有效" : "已失效") : "不存在"}</span>
+            <span class="muted map-text">${esc(oldText)}</span>
+          </span>
+          <span class="arrow">→</span>
+          <span class="branch new-branch">
+            <span class="id">${esc(newId)}</span>
+            <span class="badge valid">有效</span>
+            <span class="muted map-text">${esc(newText)}</span>
+          </span>
+        </div>`;
+    }).join("");
+    return `
+      <div class="map-group">
+        <div class="map-head">修复标识 <span class="src rebuild-text">${esc(op)}</span>
+          · ${pairs.length} 对编号映射</div>
+        ${rows}
       </div>`;
   }).join("");
 }
@@ -137,5 +192,32 @@ $("#invalidate-form").addEventListener("submit", async (e) => {
 
 $("#refresh").addEventListener("click", () =>
   refresh().catch((e) => feedback(e.message, "error-text")));
+
+$("#rebuild-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const target = $("#rb-target").value.trim();
+  const value = $("#rb-value").value;
+  const op = $("#rb-op").value.trim();
+  try {
+    const res = await api("POST",
+      `/api/records/${encodeURIComponent(target)}/rebuild`,
+      { operation_id: op, replacement_payload: { value } });
+    const mapLine = res.mapping
+      .map((m) => `${m.old_id} → ${m.new_id}`).join("、");
+    feedback(
+      `替代重建完成${res.replayed ? "（同标识重试，重放首次映射）" : ""}\n` +
+      `修复标识：${res.operation_id}\n` +
+      `替代新根：${res.replacement_record_id}\n` +
+      `编号映射（${res.mapping.length} 对）：${mapLine}\n` +
+      `旧根 ${res.target_record_id} 及旧下游已整体失效`,
+      "ok-text");
+    $("#rb-value").value = "";
+    await refresh();
+  } catch (err) {
+    feedback(`重建被拒绝（${err.code || err.status}）：${err.message}\n` +
+      (err.details ? `定位信息：${JSON.stringify(err.details, null, 2)}` : ""),
+      "error-text");
+  }
+});
 
 refresh().catch((e) => feedback(e.message, "error-text"));

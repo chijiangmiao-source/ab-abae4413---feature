@@ -8,7 +8,8 @@
   2. 构建检查：compileall 语法构建 + 应用可导入；
   3. API/HTTP 冒烟：拉起真实 gunicorn 服务（4 worker，跨进程竞争），
      经 HTTP 复现稳定编号、级联失效、操作重放、同标识换目标冲突、
-     可定位错误反馈、并发竞争不变量，以及重启后谱系/失效状态/操作重放；
+     可定位错误反馈、替代重建（分层副本/依据重指/映射重放/改参冲突）、
+     并发竞争（含重建×裁决）不变量，以及重启后谱系/失效状态/操作重放；
   4. 可选：若设置 VERIFY_TARGET_URL，则对已运行的服务（如 compose 中的
      web 服务）追加一次真实 HTTP 冒烟。
 
@@ -160,7 +161,9 @@ def run_self_hosted_phase(rep: Report, workdir: Path) -> None:
     try:
         _http_lifecycle(rep, base)
         _http_error_cases(rep, base)
+        _http_rebuild(rep, base)
         _http_concurrency(rep, base)
+        _http_concurrency_rebuild(rep, base)
     finally:
         server.stop()
 
@@ -245,6 +248,76 @@ def _http_error_cases(rep: Report, base: str) -> None:
               and r.json()["error"]["details"]["record_id"] == "GHOST")
 
 
+def _http_rebuild(rep: Report, base: str) -> None:
+    """替代重建：分层副本、依据重指、旧支失效、幂等重放与改参冲突。"""
+    a = _post(base, "/api/records",
+              {"kind": "raw", "payload": {"value": "rb-bad-root"}}).json()
+    b = _post(base, "/api/records",
+              {"kind": "raw", "payload": {"value": "rb-other-root"}}).json()
+    c = _post(base, "/api/records", {
+        "kind": "derived", "payload": {"value": "rb-mid"},
+        "parent_ids": [a["id"]]}).json()
+    d = _post(base, "/api/records", {
+        "kind": "derived", "payload": {"value": "rb-join"},
+        "parent_ids": [c["id"], b["id"]]}).json()
+
+    rb = _post(base, f"/api/records/{a['id']}/rebuild", {
+        "operation_id": "verify-op-rebuild",
+        "replacement_payload": {"value": "rb-good-root"}}).json()
+    mapping = {x["old_id"]: x["new_id"] for x in rb["mapping"]}
+    na, nc, nd = mapping[a["id"]], mapping[c["id"]], mapping[d["id"]]
+
+    records = {r["id"]: r for r in requests.get(f"{base}/api/records").json()}
+    rep.check("重建按依赖层级覆盖受影响有效闭包",
+              set(mapping) == {a["id"], c["id"], d["id"]},
+              f"mapping={sorted(mapping)}")
+    rep.check("替代新根携带替代读数、业务内容在下游副本保留",
+              records[na]["payload"] == {"value": "rb-good-root"}
+              and records[nc]["payload"] == {"value": "rb-mid"}
+              and records[nd]["payload"] == {"value": "rb-join"})
+    rep.check("已重建依据指向新编号、其余依据继续指向原记录",
+              records[nc]["parent_ids"] == [na]
+              and records[nd]["parent_ids"] == [nc, b["id"]],
+              f"nd.parents={records[nd]['parent_ids']}")
+    rep.check("旧根与旧下游整体失效且来源稳定",
+              all(records[i]["status"] == "invalid"
+                  and records[i]["invalidated_by"] == a["id"]
+                  for i in (a["id"], c["id"], d["id"])))
+    rep.check("无关节支保持有效", records[b["id"]]["status"] == "valid")
+    rep.check("不存在有效记录引用已失效记录",
+              not [r for r in records.values() if r["status"] == "valid"
+                   and any(records.get(p, {}).get("status") == "invalid"
+                           for p in r["parent_ids"])])
+
+    # 同标识同参数重试 -> 重放首次映射
+    again = _post(base, f"/api/records/{a['id']}/rebuild", {
+        "operation_id": "verify-op-rebuild",
+        "replacement_payload": {"value": "rb-good-root"}}).json()
+    rep.check("同修复标识重试重放首次映射",
+              again.get("replayed") is True
+              and {x["old_id"]: x["new_id"] for x in again["mapping"]}
+              == mapping)
+
+    # 改换替代内容 -> 409 且不留副本
+    n_before = len(requests.get(f"{base}/api/records").json())
+    conflict = _post(base, f"/api/records/{a['id']}/rebuild", {
+        "operation_id": "verify-op-rebuild",
+        "replacement_payload": {"value": "rb-tampered"}})
+    n_after = len(requests.get(f"{base}/api/records").json())
+    rep.check("同标识改换替代内容 -> 409 冲突且不留副本",
+              conflict.status_code == 409
+              and conflict.json()["error"]["code"] == "OPERATION_CONFLICT"
+              and n_after == n_before)
+
+    # 对已失效旧根重建 -> 409 无状态变化
+    stale = _post(base, f"/api/records/{a['id']}/rebuild", {
+        "operation_id": "verify-op-rebuild-late",
+        "replacement_payload": {"value": "late"}})
+    rep.check("与失效竞争失败方得到无状态变化拒绝",
+              stale.status_code == 409
+              and stale.json()["error"]["code"] == "RECORD_ALREADY_INVALID")
+
+
 def _http_concurrency(rep: Report, base: str) -> None:
     """新推导 vs 失效裁决 跨进程并发竞争。"""
     pivot = _post(base, "/api/records",
@@ -293,6 +366,67 @@ def _http_concurrency(rep: Report, base: str) -> None:
               f"pivot={pivot}, children={len(children)}")
 
 
+def _http_concurrency_rebuild(rep: Report, base: str) -> None:
+    """替代重建 vs 失效裁决 跨进程并发：完整重建或无状态变化拒绝。"""
+    pivot = _post(base, "/api/records",
+                  {"kind": "raw", "payload": {"value": "rb-pivot"}}).json()["id"]
+    m1 = _post(base, "/api/records", {
+        "kind": "derived", "payload": {"value": "rb-pre1"},
+        "parent_ids": [pivot]}).json()["id"]
+    m2 = _post(base, "/api/records", {
+        "kind": "derived", "payload": {"value": "rb-pre2"},
+        "parent_ids": [m1]}).json()["id"]
+    statuses: list[int] = []
+    errors: list[str] = []
+
+    def one(i: int) -> None:
+        s = requests.Session()
+        try:
+            if i % 2 == 0:
+                r = s.post(f"{base}/api/records/{pivot}/rebuild", json={
+                    "operation_id": f"verify-rb-race-{i}",
+                    "replacement_payload": {"value": f"fix-{i}"}}, timeout=15)
+            else:
+                r = s.post(f"{base}/api/records/{pivot}/invalidate",
+                           json={"operation_id": f"verify-rb-race-{i}"},
+                           timeout=15)
+            statuses.append(r.status_code)
+        except requests.RequestException as exc:
+            errors.append(str(exc))
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(one, range(40)))
+
+    rep.check("并发期间无传输层错误", not errors, str(errors))
+
+    records = requests.get(f"{base}/api/records").json()
+    by_id = {r["id"]: r for r in records}
+    bad = [r["id"] for r in records
+           if r["status"] == "valid"
+           and any(by_id.get(p, {}).get("status") == "invalid"
+                   for p in r["parent_ids"])]
+    rep.check("重建/裁决竞争后不存在有效记录依赖失效记录", not bad,
+              f"违规记录：{bad}" if bad else "")
+
+    # 只统计本次竞争支点这一支的副本（排除此前功能验收产生的副本）
+    old_branch = {pivot, m1, m2}
+    rebuilt = [r for r in records if r["rebuilt_from"] in old_branch]
+    if rebuilt:
+        winners = {r["rebuilt_by"] for r in rebuilt}
+        rep.check("若重建胜出：副本三层齐全且全有效、旧支全失效",
+                  len(rebuilt) == 3
+                  and all(r["status"] == "valid" for r in rebuilt)
+                  and all(by_id[i]["status"] == "invalid"
+                          for i in old_branch),
+                  f"copies={len(rebuilt)}")
+        rep.check("重建赢家唯一（同根不会被重建两次）", len(winners) == 1,
+                  f"winners={sorted(w for w in winners if w)}")
+    else:
+        rep.check("若裁决胜出：原支全部失效",
+                  all(by_id[i]["status"] == "invalid"
+                      for i in old_branch))
+
+
 def _http_restart_persistence(rep: Report, base: str) -> None:
     records = {r["id"]: r for r in requests.get(f"{base}/api/records").json()}
     ok = (records["R000001"]["status"] == "invalid"
@@ -310,6 +444,20 @@ def _http_restart_persistence(rep: Report, base: str) -> None:
 
     opq = requests.get(f"{base}/api/operations/verify-op-cascade").json()
     rep.check("操作结果可按标识查询", opq["result"] == "completed")
+
+    # 重建结果重启后仍可查询，且同标识同参数重放首次映射
+    rb_records = {r["id"]: r for r in requests.get(f"{base}/api/records").json()}
+    rb_op = requests.get(f"{base}/api/operations/verify-op-rebuild").json()
+    rep.check("重启后重建映射可按标识查询",
+              rb_op["kind"] == "rebuild" and len(rb_op["mapping"]) == 3)
+    replay_rb = _post(base, "/api/records/R000005/rebuild", {
+        "operation_id": "verify-op-rebuild",
+        "replacement_payload": {"value": "rb-good-root"}}).json()
+    rep.check("重启后重建操作重放首次映射",
+              replay_rb.get("replayed") is True
+              and replay_rb["mapping"] == rb_op["mapping"]
+              and all(rb_records[m["new_id"]]["status"] == "valid"
+                      for m in replay_rb["mapping"]))
 
 
 # --------------------------------------------------------------------------- #

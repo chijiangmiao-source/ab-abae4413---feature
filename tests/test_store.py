@@ -1,4 +1,4 @@
-"""CalibrationStore 单元测试：级联失效 / 幂等裁决 / 引用校验 / 并发 / 重启。"""
+"""CalibrationStore 单元测试：级联失效 / 幂等裁决 / 引用校验 / 并发 / 替代重建 / 重启。"""
 
 from __future__ import annotations
 
@@ -223,4 +223,219 @@ def test_persistence_after_reopen(tmp_path):
     assert replayed["replayed"] is True
     assert {c["id"] for c in replayed["cascade"]} == {a["id"], b["id"]}
     assert s2.get_operation("op-restart")["result"] == "completed"
+    s2.close()
+
+
+# --------------------------------------------------------------------- #
+# 替代重建
+# --------------------------------------------------------------------- #
+def make_diamond(store: CalibrationStore):
+    """r1(失真原始) -> r2 -> r3；r3 另据 r4(原始)；r4 -> r5（无关支）。"""
+    r1 = store.create_record("raw", {"value": "raw-1-distorted"}, None)["id"]
+    r4 = store.create_record("raw", {"value": "raw-4"}, None)["id"]
+    r2 = store.create_record("derived", {"value": "derived-2"}, [r1])["id"]
+    r3 = store.create_record("derived", {"value": "derived-3"},
+                             [r2, r4])["id"]
+    r5 = store.create_record("derived", {"value": "derived-5"}, [r4])["id"]
+    return r1, r2, r3, r4, r5
+
+
+def _map_by_old(result: dict) -> dict[str, str]:
+    return {m["old_id"]: m["new_id"] for m in result["mapping"]}
+
+
+def test_rebuild_copies_by_dependency_layers_and_repoints_basis(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    result = store.rebuild("rb-1", r1, {"value": "raw-1-fixed"})
+
+    assert result["replayed"] is False
+    assert result["target_record_id"] == r1
+    m = _map_by_old(result)
+    assert set(m) == {r1, r2, r3}  # 只复制受影响有效闭包
+    n1, n2, n3 = m[r1], m[r2], m[r3]
+
+    # 新根携带替代读数；下游副本保留原业务内容
+    assert store.get_record(n1)["payload"] == {"value": "raw-1-fixed"}
+    assert store.get_record(n1)["kind"] == "raw"
+    assert store.get_record(n2)["payload"] == {"value": "derived-2"}
+    assert store.get_record(n3)["payload"] == {"value": "derived-3"}
+
+    # 已重建依据指向新编号；其余依据继续指向原记录（r4 未受影响）
+    assert store.get_record(n2)["parent_ids"] == [n1]
+    assert store.get_record(n3)["parent_ids"] == [n2, r4]
+
+    # 溯源字段
+    assert store.get_record(n3)["rebuilt_from"] == r3
+    assert store.get_record(n3)["rebuilt_by"] == "rb-1"
+
+    # 旧根与旧下游在同一提交后全部失效，来源稳定为旧根
+    for rid in (r1, r2, r3):
+        rec = store.get_record(rid)
+        assert rec["status"] == "invalid"
+        assert rec["invalidated_by"] == r1
+    # 无关节支保持原样
+    assert store.get_record(r4)["status"] == "valid"
+    assert store.get_record(r5)["status"] == "valid"
+    store.assert_invariants()
+
+
+def test_rebuild_idempotent_replays_first_mapping(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    first = store.rebuild("rb-same", r1, {"value": "fixed"})
+    second = store.rebuild("rb-same", r1, {"value": "fixed"})
+    assert second["replayed"] is True
+    assert second["mapping"] == first["mapping"]
+    assert second["replacement_record_id"] == first["replacement_record_id"]
+    # 重放不产生新副本
+    assert len(store.list_records()) == 8
+    stored = store.get_operation("rb-same")
+    assert stored["kind"] == "rebuild"
+    assert stored["mapping"] == first["mapping"]
+
+
+def test_rebuild_same_op_changed_payload_conflicts_without_copies(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    store.rebuild("rb-conf", r1, {"value": "fixed-A"})
+    n = len(store.list_records())
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-conf", r1, {"value": "fixed-B"})
+    assert ei.value.status == 409
+    assert ei.value.code == "OPERATION_CONFLICT"
+    assert ei.value.details["original_kind"] == "rebuild"
+    assert len(store.list_records()) == n  # 不留副本、不改状态
+
+
+def test_rebuild_same_op_changed_target_conflicts(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    store.rebuild("rb-t", r1, {"value": "fixed"})
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-t", r4, {"value": "fixed"})
+    assert ei.value.code == "OPERATION_CONFLICT"
+    assert ei.value.details["conflicting_target"] == r4
+    assert store.get_record(r4)["status"] == "valid"
+
+
+def test_rebuild_op_id_shared_with_invalidation(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    store.invalidate("shared-op", r4)
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("shared-op", r1, {"value": "fixed"})
+    assert ei.value.code == "OPERATION_CONFLICT"
+    assert ei.value.details["original_kind"] == "invalidate"
+    # 未留下副本
+    assert all(r["rebuilt_from"] is None
+               for r in store.list_records())
+
+
+def test_rebuild_target_must_be_valid_raw(store):
+    r1, r2, r3, r4, r5 = make_diamond(store)
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-derived", r2, {"value": "fixed"})
+    assert ei.value.code == "REBUILD_TARGET_NOT_RAW"
+    # 未占用操作标识
+    assert store.get_operation("rb-derived") is None
+
+    store.invalidate("kill-r1", r1)
+    before = len(store.list_records())
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-after-inv", r1, {"value": "fixed"})
+    assert ei.value.status == 409
+    assert ei.value.code == "RECORD_ALREADY_INVALID"
+    assert len(store.list_records()) == before
+
+
+def test_rebuild_missing_target_is_locatable(store):
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-missing", "R000999", {"value": "fixed"})
+    assert ei.value.status == 404
+    assert ei.value.details["record_id"] == "R000999"
+
+
+def test_rebuild_requires_payload_object(store):
+    r1 = store.create_record("raw", {"value": "x"}, None)["id"]
+    with pytest.raises(StoreError) as ei:
+        store.rebuild("rb-payload", r1, "not-an-object")  # type: ignore[arg-type]
+    assert ei.value.code == "INVALID_PAYLOAD"
+
+
+def test_concurrent_rebuild_vs_invalidate_all_or_nothing(store):
+    """重建与失效裁决竞争：只能得到完整重建或无状态变化的拒绝，
+    绝不存在有效记录引用已失效记录。"""
+    pivot = store.create_record("raw", {"value": "pivot"}, None)["id"]
+    d1 = store.create_record("derived", {"value": "d1"}, [pivot])["id"]
+    d2 = store.create_record("derived", {"value": "d2"}, [d1])["id"]
+    errors: list[Exception] = []
+
+    def worker(i: int):
+        try:
+            if i % 2 == 0:
+                store.invalidate(f"race-{i}", pivot)
+            else:
+                store.rebuild(f"race-{i}", pivot, {"value": f"fix-{i}"})
+        except StoreError:
+            pass  # 竞争失败是合法结局
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(worker, range(40)))
+    assert not errors
+    store.assert_invariants()
+
+    records = {r["id"]: r for r in store.list_records()}
+    rebuilt = [r for r in records.values() if r["rebuilt_from"] is not None]
+    old_invalid = all(records[i]["status"] == "invalid"
+                      for i in (pivot, d1, d2))
+    if rebuilt:
+        # 发生过完整重建：新支三层齐全且全部有效，旧支全部失效
+        assert len(rebuilt) == 3
+        assert all(r["status"] == "valid" for r in rebuilt)
+        assert old_invalid
+        roots = [r for r in rebuilt if r["kind"] == "raw"]
+        assert len(roots) == 1
+    else:
+        # 未发生重建：裁决先行，原支全部失效
+        assert old_invalid
+
+
+def test_concurrent_duplicate_rebuild_single_mapping(store):
+    pivot = store.create_record("raw", {"value": "p"}, None)["id"]
+    d = store.create_record("derived", {"value": "d"}, [pivot])["id"]
+
+    def invoke():
+        try:
+            return store.rebuild("rb-race-single", pivot,
+                                 {"value": "fixed"})
+        except StoreError as e:
+            return e
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: invoke(), range(32)))
+    completed = [r for r in results if not isinstance(r, StoreError)]
+    assert completed
+    first = completed[0]["mapping"]
+    assert all(r["mapping"] == first for r in completed)
+    store.assert_invariants()
+    # 只有一条新根 + 一条新推导
+    records = store.list_records()
+    assert len([r for r in records if r["rebuilt_from"] == pivot]) == 1
+    assert len([r for r in records if r["rebuilt_from"] == d]) == 1
+
+
+def test_rebuild_persistence_after_reopen(tmp_path):
+    db = str(tmp_path / "rebuild.db")
+    s1 = CalibrationStore(db)
+    a = s1.create_record("raw", {"value": "a"}, None)["id"]
+    b = s1.create_record("derived", {"value": "b"}, [a])["id"]
+    first = s1.rebuild("rb-restart", a, {"value": "a-fixed"})
+    s1.close()
+
+    s2 = CalibrationStore(db)
+    m = _map_by_old(first)
+    assert s2.get_record(m[a])["payload"] == {"value": "a-fixed"}
+    assert s2.get_record(m[b])["parent_ids"] == [m[a]]
+    assert s2.get_record(a)["status"] == "invalid"
+    replayed = s2.rebuild("rb-restart", a, {"value": "a-fixed"})
+    assert replayed["replayed"] is True
+    assert replayed["mapping"] == first["mapping"]
     s2.close()
